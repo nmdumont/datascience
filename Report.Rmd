@@ -1,0 +1,303 @@
+---
+title: "Report on Movielens"
+author: "Nathalie Dumont"
+date: "3/11/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, collapse = TRUE, tidy.opts = list(blank=FALSE, width.cutoff = 60),fig.width = 6, warning = FALSE, message = FALSE)
+```
+
+# Introduction to movielens dataset
+In this report, we will start by downloading the movielens dataset and cleaning the data. 
+We will observe the influence of the different variables contained in the dataset, by making plots. After exploring the data, we will model the different parameters in order to obtain a prediction for the test set, and confront it to the validation set. As a measure of the accuracy of our prediction, we will use the root mean squared error. Afterwards we will propose some other possibilities to improve our model.
+
+Disclaimer : This report is heavily based on the textbook of the edx Data science course. It helped me a lot to compute the graphic parts and to structure the analysis. Also, English is not my mother tongue, so please excuse my grammatical mistakes. 
+
+# Datacleaning
+We start this report by downloading the data and creating two sets : a test one and a validation one. 
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(lubridate)
+library(tidyr)
+library(tidyverse)
+library(stringr)
+library(purrr)
+library(readr)
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding")
+
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+```
+
+The movielens dataset is a huge dataset, as you can see :
+```{r echo=TRUE}
+str(edx)
+```
+The rating consists in associating the userID with a movie, a rating, the timestamp of the rating, the title consisting in the name of the movie with its year in parenthesis, and the genres it belongs to.  
+It contains more than 9 million observations, which are movie ratings from 69 878 different users on 10 677 different movies.
+```{r echo=TRUE}
+n_distinct(edx$userId)
+```
+
+From this, we can assume that more than one user gives ratings for several movies. 
+The title format is not satisfying since it combines two pieces of information : title and year. We will slice it in two columns.
+```{r splitting-title, echo=FALSE}
+edx_mod<-edx %>%
+  mutate("title"=str_match(edx$title,"(.*) \\((.*)\\)")[,2], "year"=as.numeric(str_match(edx$title,"(.*) \\((.*)\\)")[,3])) 
+head(edx_mod)
+```
+We are also going to change the timestamp to something more readable: the week the rating happened.
+```{r echo=FALSE}
+edx_mod2 <-edx_mod %>%
+  mutate(date = as_datetime(timestamp)) %>% 
+  mutate(date = round_date(date, unit = "week"))
+head(edx_mod2)
+```
+
+
+# Influence of the various parameters
+## Influence of year
+Let's observe the influence of year on the movie ratings :
+
+```{r year-rating}
+edx_mod %>% group_by(movieId) %>%
+  summarize(n = n(), year = as.character(first(year))) %>%
+  qplot(year, n, data = ., geom = "boxplot") +
+  coord_trans(y = "sqrt") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+We can see the number of ratings improving in the 90's, and decreasing afterwards. So years seem to have a strong impact on the number of ratings. What about the most rated movies ?
+
+## Influence of the number of ratings
+
+```{r rate}
+edx_mod %>% 
+  filter(year >= 1995) %>%
+  group_by(movieId) %>%
+  summarize(n = n(), years = 2020 - first(year),
+            title = title[1],
+            rating = mean(rating)) %>%
+  mutate(rate = n/years) %>%
+  top_n(25, rate) %>%
+  arrange(desc(rate)) 
+```
+It seems that the most rated movies have great ratings. This plot confirms it.
+
+```{r}
+edx_mod %>% 
+  filter(year >= 1993) %>%
+  group_by(movieId) %>%
+  summarize(n = n(), years = 2018 - first(year),
+            title = title[1],
+            rating = mean(rating)) %>%
+  mutate(rate = n/years) %>%
+  ggplot(aes(rate, rating)) +
+  geom_point() +
+  geom_smooth()
+```
+
+## Influence of date
+Does the timestamp (or date as we have renamed it) has an influence on ratings ?
+
+```{r date-influence}
+edx_mod2 %>%
+  group_by(date) %>%
+  summarize(rating = mean(rating)) %>%
+  ggplot(aes(date, rating)) +
+  geom_point() +
+  geom_smooth()
+```
+
+Date seems to have only some influence on ratings.
+
+## Influence of genre
+We will plot the average rating by genre :
+
+```{r genre-influence}
+edx_mod2 %>% group_by(genres) %>%
+  summarize(n = n(), avg = mean(rating), se = sd(rating)/sqrt(n())) %>%
+  filter(n >= 50000) %>% 
+  mutate(genres = reorder(genres, avg)) %>%
+  ggplot(aes(x = genres, y = avg, ymin = avg - 2*se, ymax = avg + 2*se)) + 
+  geom_point() +
+  geom_errorbar() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+We can observe that genre has a great influence upon rating.
+
+## Influence of user
+Let's see the mean of the ratings for each user :
+
+
+```{r}
+edx_mod2%>% 
+  group_by(userId) %>% 
+  summarize(b_u = mean(rating)) %>% 
+  filter(n()>=100) %>%
+  ggplot(aes(b_u)) + 
+  geom_histogram(bins = 30, color = "black")
+```
+
+We can see on this histogram that some users are prone to good rating whereas others are more critical. So it is likely that the user will influence the rating.
+
+# Modeling approach
+
+## Mean
+If every movie had the same rating, we could predict the mean rating for any movie. The estimate that minimizes RMSE is the average of all ratings. 
+```{r echo=TRUE}
+mu_hat<-mean(edx_mod$rating)
+mu_hat
+```
+
+We can build an RMSE function to evaluate our prediction
+```{r echo=TRUE}
+RMSE<-function(true_ratings,predicted_ratings){
+  sqrt(mean((true_ratings-predicted_ratings)^2))
+}
+```
+
+The simplest model would predict the mean of ratings for unrated movie. We compare the actual rating versus the predicted rating, which in our case is the mean, mu_hat.
+```{r echo=TRUE}
+RMSE(edx_mod$rating,mu_hat)
+```
+The root squared mean error is quite high. As we get something around 1, we are 1 point away from the actual rating when we are predicting. 
+
+## Best and worst movies
+It is likely that the highest rated movies will get higher ranking, and worst movies on the contrary will get lower ranking. We will add a term to the mean rating in our model, which represents the average rating for each movie. It will be the average of the true ratings for the movie minus the average.
+
+```{r}
+movie_avgs<-edx_mod%>%
+  group_by(movieId)%>%
+  summarize(b_i=mean(rating-mu_hat))
+qplot(b_i, data = movie_avgs, bins = 10, color = I("black"))
+```
+
+This estimate - a biais for bad/good movie, variates a lot. It seems a good idea to take it in consideration for our model. Let's see how it improves our RMSE :
+
+```{r echo=TRUE}
+predicted_ratings<-mu_hat+edx_mod %>%
+  left_join(movie_avgs,by='movieId') %>%
+  pull(b_i)
+RMSE(predicted_ratings,edx_mod$rating)
+```
+
+## Modeling user effect
+We are going to compute the estimate of the user effect, and add it to our model to predict the ratings. The RMSE improves.
+```{r echo=TRUE}
+user_avgs <- edx_mod2 %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu_hat - b_i))
+predicted_ratings <- edx_mod2 %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu_hat + b_i + b_u) %>%
+  pull(pred)
+RMSE(predicted_ratings, edx_mod$rating)
+```
+
+## Modeling time effect
+As we have seen that time has a slight effect on ratings, we model the effect of time (or date) via a smooth function.
+```{r echo=TRUE}
+time_effect <- edx_mod2 %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(date=round_date(date,unit='week'))%>%
+  group_by(date)%>%
+  summarize(b_t = smooth(mean(rating - mu_hat - b_i - b_u)))
+edx_mod2<-edx_mod2%>%mutate(date=round_date(date,unit='week'))
+```
+
+Then we can view how the RMSE has improved
+```{r}
+predicted_ratings <- edx_mod2 %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(time_effect, by='date')%>%
+  mutate(pred = mu_hat + b_i + b_u + b_t) %>%
+  pull(pred)
+
+RMSE(predicted_ratings, edx_mod2$rating)
+```
+
+Just a little, as expected.
+
+## Modeling the genre effect
+Let's model the genre effect :
+```{r echo=TRUE}
+genre<-edx_mod2%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(time_effect,by='date') %>%
+  group_by(genres)%>%
+  summarize(b_g = mean(rating - mu_hat - b_i - b_u - b_t))
+
+predicted_ratings <- edx_mod2 %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(time_effect, by='date')%>%
+  left_join(genre, by='genres') %>%
+  mutate(pred = mu_hat + b_i + b_u + b_t + b_g) %>%
+  pull(pred)
+
+RMSE(predicted_ratings, edx_mod2$rating)
+```
+
+# The results
+
+We have now a model which includes the influence of multiple factors : general rating of the movie by other users, date, genre.
+We will now calculate the RMSE over the validation set. We start by splitting the title column and reconstructing the date.
+```{r echo=TRUE}
+validation_2<-validation %>%
+  mutate("title"=str_match(validation$title,"(.*) \\((.*)\\)")[,2], "year"=as.numeric(str_match(validation$title,"(.*) \\((.*)\\)")[,3])) 
+validation_2 <-validation_2 %>%
+  mutate(date = as_datetime(timestamp)) %>% 
+  mutate(date = round_date(date, unit = "week"))
+predicted_ratings <- validation_2 %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(time_effect, by='date')%>%
+  left_join(genre, by='genres') %>%
+  mutate(pred = mu_hat + b_i + b_u + b_t + b_g) %>%
+  pull(pred)
+
+RMSE(predicted_ratings, validation_2$rating)
+```
+
+# Conclusion
+
+We could improve our results several ways. As proposed in the course's textbook, we could regularize estimates. We could also do a PCA, principal components analysis to identify correlation between factors.
